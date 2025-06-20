@@ -1,0 +1,19 @@
+[project]
+name = "kikostats"
+description = "Real-time monitoring and statistics for ComfyUI"
+version = "0.1.0"
+license = {file = "LICENSE"}
+dependencies = [
+    "nvidia-ml-py>=12.535.161",
+    "psutil>=5.9.0"
+]
+
+[project.urls]
+Repository = "https://github.com/ComfyAssets/ComfyUI-KikoStats"
+#  Used by Comfy Registry https://registry.comfy.org
+
+[tool.comfy]
+PublisherId = "kiko9"
+DisplayName = "ComfyUI-KikoStats"
+Icon = "https://avatars.githubusercontent.com/u/213204677?s=200"
+includes = []
