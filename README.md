@@ -5,17 +5,20 @@ Real-time GPU and system resource monitoring for ComfyUI with **per-node perform
 ## ✨ Features
 
 - 📊 **Real-time Resource Monitoring**
+
   - GPU utilization, VRAM usage, temperature, and power draw
   - CPU usage and RAM statistics
   - Updates every second via WebSocket
 
 - 🎯 **Per-Node Performance Tracking** (Unique Feature!)
+
   - Track CPU and GPU usage for each individual node
   - Measure execution time per node
   - Identify workflow bottlenecks
   - See which nodes consume the most resources
 
 - 🎨 **Clean, Integrated UI**
+
   - Embedded monitoring display in the node
   - Expandable node performance list
   - Real-time updates without workflow execution
@@ -47,12 +50,12 @@ pip install -r requirements.txt
 
 ### Method 3: ComfyUI Manager
 
-*Coming soon - will be available through ComfyUI Manager*
+_Coming soon - will be available through ComfyUI Manager_
 
 ## Usage
 
 1. **Restart ComfyUI** after installation
-2. In ComfyUI, add a new node and search for "Resource Monitor" 
+2. In ComfyUI, add a new node and search for "Resource Monitor"
 3. Find it under the **ComfyAssets** category
 4. Click **"Start Monitoring"** button to see real-time stats
 5. Run any workflow to see per-node performance data
@@ -60,6 +63,7 @@ pip install -r requirements.txt
 ### Understanding the Display
 
 **Real-time Stats:**
+
 ```
 🖥️ GPU: 45%
 VRAM: 1024MB / 24576MB
@@ -70,11 +74,12 @@ RAM: 3831MB / 64197MB
 ```
 
 **Per-Node Performance (after workflow execution):**
+
 ```
 📊 Node Performance
 KSampler: 12.8% CPU, 87.3% GPU
           (15.7s)
-VAE Decode: 15.2% CPU, 45.8% GPU  
+VAE Decode: 15.2% CPU, 45.8% GPU
           (2.3s)
 Load Checkpoint: 8.2% CPU, 12.1% GPU
           (1.2s)
@@ -105,12 +110,14 @@ Load Checkpoint: 8.2% CPU, 12.1% GPU
 
 **Category**: ComfyAssets  
 **Inputs**:
+
 - `update_interval` (FLOAT): Monitoring refresh rate in seconds (0.1-60.0)
-- `display_mode` (CHOICE): Output format - "text", "json", or "both"  
+- `display_mode` (CHOICE): Output format - "text", "json", or "both"
 - `enable_gpu` (BOOLEAN): Enable GPU monitoring (optional)
 - `enable_system` (BOOLEAN): Enable system monitoring (optional)
 
 **Outputs**:
+
 - `stats` (STRING): Formatted monitoring statistics
 - `json_data` (STRING): JSON data for chaining to other nodes
 
@@ -129,19 +136,17 @@ Load Checkpoint: 8.2% CPU, 12.1% GPU
 
 ## What Makes KikoStats Different?
 
-| Feature | KikoStats | Crystools | Elegant Monitor |
-|---------|-----------|-----------|-----------------|
-| Real-time monitoring | ✅ | ✅ | ✅ |
-| **Per-node tracking** | ✅ | ❌ | ❌ |
-| GPU stats | ✅ | ✅ | ✅ |
-| CPU/RAM stats | ✅ | ✅ | ✅ |
-| Embedded UI | ✅ | ❌ | ✅ |
-| WebSocket updates | ✅ | ✅ | ❌ |
-| Execution timing | ✅ | ❌ | ❌ |
+| Feature               | KikoStats | Crystools | Elegant Monitor |
+| --------------------- | --------- | --------- | --------------- |
+| Real-time monitoring  | ✅        | ✅        | ✅              |
+| **Per-node tracking** | ✅        | ❌        | ❌              |
+| GPU stats             | ✅        | ✅        | ✅              |
+| CPU/RAM stats         | ✅        | ✅        | ✅              |
+| Embedded UI           | ✅        | ❌        | ✅              |
+| WebSocket updates     | ✅        | ✅        | ❌              |
+| Execution timing      | ✅        | ❌        | ❌              |
 
 ## Development
-
-See [CLAUDE.md](CLAUDE.md) for development guidelines.
 
 ## License
 
