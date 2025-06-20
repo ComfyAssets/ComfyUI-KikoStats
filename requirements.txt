@@ -1,0 +1,3 @@
+# Core monitoring dependencies
+nvidia-ml-py>=12.535.161  # GPU monitoring via NVIDIA Management Library
+psutil>=5.9.0             # System resource monitoring
