@@ -193,12 +193,8 @@ app.registerExtension({
               const textStr = output.text.join('');
               // Processing text output
               
-              // TEMPERATURE DEBUGGING
-              const tempLines = textStr.split('\n').filter(line => line.includes('Temperature'));
-              console.log("📊 Temperature lines:", tempLines);
               const tempRegex = /Temperature:\s*([\d.]+)°C/;
               const tempMatch = textStr.match(tempRegex);
-              console.log("📊 Temperature regex match:", tempMatch);
               
               // Try to extract data from the text output
               const mockData = {
@@ -221,13 +217,9 @@ app.registerExtension({
                 }
               };
               
-              console.log("📊 Parsed data from text - GPU Temp:", mockData.gpu.temperature);
-              
               // If backend provided 0°C, inject realistic temperature
               if (mockData.gpu.temperature === 0 && mockData.gpu.available) {
-                console.log("📊 Backend provided 0°C - injecting realistic temperature");
                 mockData.gpu.temperature = Math.floor(Math.random() * 25) + 45; // 45-70°C
-                console.log("📊 Injected temperature:", mockData.gpu.temperature);
               }
               
               if (monitorNode.updateMonitoringData) {
@@ -253,7 +245,6 @@ app.registerExtension({
 
   async beforeRegisterNodeDef(nodeType, nodeData, app) {
     if (nodeData.name === "ResourceMonitor") {
-      console.log("📊 Registering ResourceMonitor node with UI");
       
       // Store original methods
       const onNodeCreated = nodeType.prototype.onNodeCreated;
@@ -272,6 +263,14 @@ app.registerExtension({
         this.monitoringActive = false;
         this.monitorData = null;
         
+        // Initialize resize tracking flags
+        this.userHasManuallyResized = false;
+        this.programmaticResize = false;
+        
+        // Initialize popout state
+        this.isChartsPoppedOut = false;
+        this.popoutWindow = null;
+        
         // Create monitoring UI container
         const uiContainer = document.createElement("div");
         uiContainer.style.cssText = `
@@ -284,6 +283,9 @@ app.registerExtension({
           font-size: 12px;
           color: #ffffff;
           min-height: 120px;
+          box-sizing: border-box;
+          overflow: hidden;
+          max-height: calc(100% - 20px);
         `;
         
         // Initialize history buffers for chart data
@@ -306,20 +308,319 @@ app.registerExtension({
 
         this.buildMonitorInterface(uiContainer);
 
-        // Add as widget
+        // Add as widget with proper options
+        const widgetOptions = {
+          hideOnZoom: false,
+          selectOn: ["focus", "click"]
+        };
+        
         this.monitorWidget = this.addDOMWidget(
           "resource_monitor_ui",
           "div",
           uiContainer,
+          widgetOptions
         );
 
-        // Set node size for expanded view with chart and per-node tracking
-        if (!this.hasBeenResized) {
-          this.size = [380, 420];
-        }
+        // Calculate and set initial node size after DOM is ready
+        requestAnimationFrame(() => {
+          this.calculateAndSetNodeSize();
+        });
+
+        // Setup resize observer for dynamic sizing
+        this.setupResizeObserver(uiContainer);
 
         // Start monitoring updates
         this.startMonitoringUpdates();
+      };
+
+      // Cleanup method for when node is removed
+      nodeType.prototype.onRemoved = function() {
+        // Clean up resize observer
+        if (this.resizeObserver) {
+          this.resizeObserver.disconnect();
+          this.resizeObserver = null;
+        }
+        
+        // Clear timeouts
+        if (this.resizeTimeout) {
+          clearTimeout(this.resizeTimeout);
+        }
+        if (this.chartUpdateInterval) {
+          clearInterval(this.chartUpdateInterval);
+        }
+        
+        // Remove from global registry
+        if (window.resourceMonitorNodes) {
+          const index = window.resourceMonitorNodes.indexOf(this);
+          if (index > -1) {
+            window.resourceMonitorNodes.splice(index, 1);
+          }
+        }
+      };
+
+      // LiteGraph computeSize method for dynamic sizing
+      nodeType.prototype.computeSize = function() {
+        const headerHeight = 100; // Node header and input widgets
+        const statsBarHeight = 80; // Top stats bar with CPU/GPU/etc
+        const chartHeight = 140; // Chart container height  
+        const baseNodeListHeight = 90; // Base node list height (header + empty message)
+        const padding = 60; // Various paddings and margins
+        
+        // Load settings to determine mode if not set
+        if (!this.displayMode) {
+          this.loadSettings();
+        }
+        
+        // Calculate dynamic node list height based on actual content
+        let nodeListHeight = baseNodeListHeight;
+        const completedNodes = window.kikoStatsCompletedNodes || [];
+        
+        if (completedNodes.length > 0) {
+          const nodeListHeaderHeight = 50; // Header with title and copy button
+          const nodeItemHeight = 45; // Height per node item (more accurate - includes padding, borders, and 2-line content)
+          const maxVisibleNodes = 15; // Increased to show more nodes without artificial scrolling
+          const visibleNodes = Math.min(completedNodes.length, maxVisibleNodes);
+          nodeListHeight = nodeListHeaderHeight + (visibleNodes * nodeItemHeight) + 30; // Header + items + extra padding
+          
+          // Add scroll indicator height if there are more nodes than visible
+          if (completedNodes.length > maxVisibleNodes) {
+            nodeListHeight += 20; // Extra space for scroll indicators
+          }
+        }
+        
+        let totalHeight = headerHeight + statsBarHeight + chartHeight + nodeListHeight + padding;
+        let width = 400;
+        
+        // Adjust for individual mode
+        if (this.displayMode === 'individual') {
+          const panelCount = this.enabledPanels ? this.enabledPanels.length : 5;
+          const panelHeight = 82; // Height per individual panel (70px + 6px margin + 6px padding)
+          totalHeight = headerHeight + statsBarHeight + (panelCount * panelHeight) + nodeListHeight + padding;
+          width = 420; // Wider for individual panels
+        }
+        
+        // If charts are popped out, reduce height significantly
+        if (this.isChartsPoppedOut) {
+          totalHeight = headerHeight + statsBarHeight + nodeListHeight + padding - chartHeight;
+          // For individual mode, remove all panel heights
+          if (this.displayMode === 'individual') {
+            const panelCount = this.enabledPanels ? this.enabledPanels.length : 5;
+            const panelHeight = 82;
+            totalHeight = headerHeight + statsBarHeight + nodeListHeight + padding - (panelCount * panelHeight);
+          }
+        }
+        
+        // Return computed size with higher cap for individual mode
+        const maxHeight = this.displayMode === 'individual' ? 1000 : 850;
+        return [width, Math.min(totalHeight, maxHeight)];
+      };
+
+      // Calculate and set appropriate node size based on content
+      nodeType.prototype.calculateAndSetNodeSize = function() {
+        // Don't override user manual resizing - respect their chosen size
+        if (this.userHasManuallyResized) {
+          return;
+        }
+        
+        // Use the same logic as computeSize to ensure consistency
+        let calculatedSize = this.computeSize();
+        
+        // Try to get more accurate measurement from actual DOM if available
+        if (this.container) {
+          const actualHeight = this.measureActualContentHeight();
+          if (actualHeight > 0) {
+            // Use actual height if it's larger than calculated
+            calculatedSize[1] = Math.max(calculatedSize[1], actualHeight + 50); // Add some padding
+          }
+        }
+        
+        // Force LiteGraph to recognize the size change
+        const oldSize = [...(this.size || [400, 500])];
+        
+        // Set the node size
+        this.size = calculatedSize;
+        
+        // Force LiteGraph to accept the size change by manipulating the node directly
+        if (this.graph && this.graph.canvas) {
+          // Force the node to be marked as dirty
+          this.setDirtyCanvas(true, true);
+        }
+        
+        // Force a resize event if the size actually changed
+        if (oldSize[0] !== calculatedSize[0] || oldSize[1] !== calculatedSize[1]) {
+          
+          // Mark this as a programmatic resize so onResize handler knows not to flag it as manual
+          this.programmaticResize = true;
+          
+          // Multiple ways to force LiteGraph to recognize the change
+          if (this.onResize) {
+            this.onResize(calculatedSize);
+          }
+          
+          // Clear the flag after the resize
+          this.programmaticResize = false;
+          
+          // Force widget updates
+          if (this.widgets) {
+            this.widgets.forEach(widget => {
+              if (widget.onResize) {
+                widget.onResize();
+              }
+            });
+          }
+          
+          // Force graph redraw
+          if (app && app.graph) {
+            app.graph.setDirtyCanvas(true, true);
+            // Also force an immediate canvas update
+            if (app.canvas) {
+              app.canvas.setDirty(true, true);
+            }
+          }
+        }
+        
+        // Mark that we've set the size programmatically
+        this.hasBeenResized = true;
+      };
+      
+      // Measure actual DOM content height for more accurate sizing
+      nodeType.prototype.measureActualContentHeight = function() {
+        if (!this.container) {
+          return 0;
+        }
+        
+        try {
+          // Get the scrollHeight of the main container (actual content height)
+          const containerScrollHeight = this.container.scrollHeight;
+          const containerClientHeight = this.container.clientHeight;
+          
+          // Get the height of the node list specifically
+          const nodeListEl = this.container.querySelector('#nodeList');
+          if (nodeListEl) {
+            const nodeListScrollHeight = nodeListEl.scrollHeight;
+            const nodeListClientHeight = nodeListEl.clientHeight;
+            const nodeListOffsetTop = nodeListEl.offsetTop;
+            
+            // Calculate total needed height: everything above node list + actual node list height
+            const calculatedHeight = nodeListOffsetTop + nodeListScrollHeight + 20; // Add bottom padding
+            
+            return calculatedHeight;
+          }
+          
+          return containerScrollHeight;
+        } catch (e) {
+          return 0;
+        }
+      };
+      
+      // Setup resize observer for dynamic content changes
+      nodeType.prototype.setupResizeObserver = function(container) {
+        if (!window.ResizeObserver) {
+          console.warn("ResizeObserver not supported, falling back to static sizing");
+          return;
+        }
+        
+        // Create resize observer
+        this.resizeObserver = new ResizeObserver((entries) => {
+          for (const entry of entries) {
+            // Don't react to every small change
+            if (this.resizeTimeout) {
+              clearTimeout(this.resizeTimeout);
+            }
+            
+            this.resizeTimeout = setTimeout(() => {
+              this.handleContainerResize(entry.contentRect);
+            }, 100);
+          }
+        });
+        
+        // Start observing
+        this.resizeObserver.observe(container);
+      };
+      
+      // Handle container resize events
+      nodeType.prototype.handleContainerResize = function(contentRect) {
+        // Update canvases based on new size
+        if (this.chartCanvas && this.displayMode !== 'individual') {
+          this.updateCanvasSize(this.chartCanvas);
+          this.drawChart();
+        } else if (this.individualCanvases) {
+          // Update all individual canvases
+          Object.values(this.individualCanvases).forEach(({ canvas }) => {
+            this.updateCanvasSize(canvas);
+          });
+          this.updateIndividualCharts();
+        }
+      };
+      
+      // Update canvas size properly
+      nodeType.prototype.updateCanvasSize = function(canvas) {
+        if (!canvas) return;
+        
+        const rect = canvas.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        
+        // Only update if we have actual dimensions
+        if (rect.width > 0 && rect.height > 0) {
+          // Set canvas size accounting for device pixel ratio
+          canvas.width = rect.width * dpr;
+          canvas.height = rect.height * dpr;
+          
+          // Scale canvas back down using CSS
+          canvas.style.width = rect.width + 'px';
+          canvas.style.height = rect.height + 'px';
+          
+          // Scale context to match device pixel ratio
+          const ctx = canvas.getContext('2d');
+          ctx.scale(dpr, dpr);
+        }
+      };
+      
+      // Restart the entire chart system (recovery method)
+      nodeType.prototype.restartChartSystem = function() {
+        console.log("🔄 Restarting chart system...");
+        
+        try {
+          // Clear any existing intervals
+          if (this.chartUpdateInterval) {
+            clearInterval(this.chartUpdateInterval);
+            this.chartUpdateInterval = null;
+          }
+          
+          // Reinitialize main canvas if it exists
+          if (this.chartCanvas) {
+            const canvas = this.chartCanvas;
+            const ctx = canvas.getContext('2d');
+            this.chartContext = ctx;
+            this.updateCanvasSize(canvas);
+          }
+          
+          // Reinitialize individual canvases if they exist
+          if (this.individualCanvases) {
+            Object.keys(this.individualCanvases).forEach(key => {
+              const canvasInfo = this.individualCanvases[key];
+              if (canvasInfo.canvas) {
+                canvasInfo.ctx = canvasInfo.canvas.getContext('2d');
+                this.updateCanvasSize(canvasInfo.canvas);
+              }
+            });
+          }
+          
+          // Restart the update loop
+          this.startChartUpdates();
+          
+          // Force initial draw
+          requestAnimationFrame(() => {
+            if (this.displayMode === 'individual' && this.individualCanvases) {
+              this.updateIndividualCharts();
+            } else if (this.chartCanvas) {
+              this.drawChart();
+            }
+          });
+          
+        } catch (error) {
+          console.error("Failed to restart chart system:", error);
+        }
       };
 
       // Handle monitoring data updates from API events
@@ -396,21 +697,11 @@ app.registerExtension({
           available: stats.gpu?.available || false
         };
         
-        console.log("📊 Raw temperature data:", {
-          rawTemp: stats.gpu?.temperature,
-          tempValue,
-          tempPercent,
-          available: stats.gpu?.available,
-          fullGpuData: stats.gpu
-        });
-        
         // FINAL SAFETY NET: If we still have 0°C at this point, force realistic temp
         if (tempValue === 0 && stats.gpu?.available) {
-          console.log("📊 FINAL SAFETY: Forcing realistic temperature (was 0°C)");
           const forcedTemp = Math.floor(Math.random() * 25) + 45; // 45-70°C
           this.currentResourceData.temp.value = forcedTemp;
           this.currentResourceData.temp.percent = Math.min((forcedTemp / 90) * 100, 100);
-          console.log("📊 Forced temperature:", forcedTemp);
         }
         
         this.currentResourceData.timestamp = timestamp;
@@ -436,36 +727,31 @@ app.registerExtension({
       
       // Update ALL UI elements from single source of truth
       nodeType.prototype.updateAllUI = function() {
-        // Updating ALL UI from single source of truth
-        
         // Update top stats bar
         this.updateTopStatsBar();
         
-        // Update charts based on current mode
-        if (this.displayMode === 'individual' && this.individualCanvases) {
-          this.updateIndividualCharts();
+        // Update charts based on current mode and popout state
+        if (this.isChartsPoppedOut) {
+          // Update popout charts
+          if (this.displayMode === 'individual' && this.popoutIndividualCanvases) {
+            this.updatePopoutIndividualCharts();
+          } else if (this.popoutCanvas) {
+            this.drawPopoutChart();
+          }
         } else {
-          this.drawChart();
+          // Update node charts
+          if (this.displayMode === 'individual' && this.individualCanvases) {
+            this.updateIndividualCharts();
+          } else {
+            this.drawChart();
+          }
         }
       };
       
       // Update top stats bar from single source of truth
       nodeType.prototype.updateTopStatsBar = function() {
         if (!this.container) {
-          console.log('🌡️ ERROR: No container found for top stats bar update');
           return;
-        }
-        
-        // DEBUG: Check if tempValue element exists
-        const tempEl = this.container.querySelector('#tempValue');
-        const allTempElements = document.querySelectorAll('#tempValue');
-        console.log(`🌡️ Container check: tempValue element exists=${!!tempEl}, total tempValue elements on page=${allTempElements.length}, temp data:`, this.currentResourceData.temp);
-        
-        if (allTempElements.length > 1) {
-          console.log(`🌡️ WARNING: Multiple tempValue elements found! This could cause conflicts.`);
-          allTempElements.forEach((el, index) => {
-            console.log(`🌡️ Element ${index}: text="${el.textContent}", visible=${getComputedStyle(el).display !== 'none'}`);
-          });
         }
         
         const updates = [
@@ -484,36 +770,16 @@ app.registerExtension({
           const displayValue = Math.round(update.data.value);
           const barValue = update.usePercent === false ? update.data.percent || update.data.value : update.data.value;
           
-          // TEMPERATURE DEBUGGING
-          if (update.id === 'tempValue') {
-            console.log(`🌡️ TEMP UPDATE: ID=${update.id}, Element Found=${!!percentEl}, DisplayValue=${displayValue}, RawData=`, update.data);
-            if (percentEl) {
-              console.log(`🌡️ Before: ${percentEl.textContent}, Setting: ${displayValue}${update.suffix}`);
-              console.log(`🌡️ Element parent:`, percentEl.parentElement);
-              console.log(`🌡️ Element style display:`, getComputedStyle(percentEl).display);
-            } else {
-              console.log('🌡️ ERROR: tempValue element not found!');
-            }
-          }
-          
           if (percentEl) {
             percentEl.textContent = `${displayValue}${update.suffix}`;
-            // TEMPERATURE DEBUGGING: Check if update actually stuck
-            if (update.id === 'tempValue') {
-              setTimeout(() => {
-                console.log(`🌡️ VERIFY: Element content after 100ms: "${percentEl.textContent}"`);
-              }, 100);
-            }
           }
           if (barEl) barEl.style.width = `${barValue}%`;
         });
         
-        console.log("📊 Top stats bar updated from single source - TEMP:", this.currentResourceData.temp);
       };
 
       // Build the monitoring interface
       nodeType.prototype.buildMonitorInterface = function(container) {
-        console.log("🌡️ BUILD: Building monitor interface - this will reset all values to defaults");
         container.innerHTML = `
           <div style="
             display: flex;
@@ -524,15 +790,26 @@ app.registerExtension({
             <div style="color: #4fc3f7; font-weight: bold; font-size: 14px;">
               📊 Resource Monitor
             </div>
-            <button id="settingsBtn" style="
-              background: #333;
-              color: white;
-              border: none;
-              padding: 4px 8px;
-              border-radius: 3px;
-              cursor: pointer;
-              font-size: 10px;
-            ">⚙️ Settings</button>
+            <div style="display: flex; gap: 4px;">
+              <button id="popoutBtn" style="
+                background: #333;
+                color: white;
+                border: none;
+                padding: 4px 8px;
+                border-radius: 3px;
+                cursor: pointer;
+                font-size: 10px;
+              ">🖼️ Popout</button>
+              <button id="settingsBtn" style="
+                background: #333;
+                color: white;
+                border: none;
+                padding: 4px 8px;
+                border-radius: 3px;
+                cursor: pointer;
+                font-size: 10px;
+              ">⚙️ Settings</button>
+            </div>
           </div>
           
           <div id="resourcePanels" style="
@@ -683,8 +960,8 @@ app.registerExtension({
             border-radius: 4px;
             padding: 8px;
             border: 1px solid #333;
-            max-height: 150px;
-            overflow-y: auto;
+            min-height: 60px;
+            overflow-x: hidden;
           ">
             <div style="
               display: flex;
@@ -915,26 +1192,26 @@ app.registerExtension({
         // Display mode settings - load from localStorage if available
         this.loadSettings();
         
-        // Set canvas size (simplified approach)
-        const resizeCanvas = () => {
-          const rect = canvas.getBoundingClientRect();
-          canvas.width = rect.width;
-          canvas.height = rect.height;
-          canvas.style.width = rect.width + 'px';
-          canvas.style.height = rect.height + 'px';
-        };
-        
-        // Initial resize
-        setTimeout(resizeCanvas, 100);
+        // Initialize canvas with proper sizing
+        this.initializeCanvas(canvas, ctx);
         
         // Handle LiteGraph zoom changes
-        this.setupZoomHandling(canvas, ctx, resizeCanvas);
+        this.setupZoomHandling(canvas, ctx);
         
         // Add event listeners
+        const popoutBtn = container.querySelector('#popoutBtn');
         const settingsBtn = container.querySelector('#settingsBtn');
         const settingsModal = container.querySelector('#settingsModal');
         const closeSettings = container.querySelector('#closeSettings');
         const saveSettings = container.querySelector('#saveSettings');
+        
+        popoutBtn.onclick = () => {
+          if (this.isChartsPoppedOut) {
+            this.closePopoutWindow();
+          } else {
+            this.createPopoutWindow();
+          }
+        };
         
         settingsBtn.onclick = () => {
           // Restore current settings in the modal
@@ -982,6 +1259,9 @@ app.registerExtension({
           // Rebuild the interface with new settings
           this.rebuildInterface();
           
+          // Force node to recalculate its size
+          this.calculateAndSetNodeSize();
+          
           settingsModal.style.display = 'none';
         };
         
@@ -1008,51 +1288,153 @@ app.registerExtension({
         this.startChartUpdates();
         
         // Force initial chart draw and apply loaded settings
-        setTimeout(() => {
-          // Apply the loaded settings to the interface
-          if (this.displayMode !== 'combined') {
-            this.rebuildInterface();
-            // After rebuild, restore current values from single source of truth
-            this.updateAllUI();
-          } else {
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            // Apply the loaded settings to the interface
+            if (this.displayMode !== 'combined') {
+              this.rebuildInterface();
+              // After rebuild, restore current values from single source of truth
+              this.updateAllUI();
+            } else {
+              this.drawChart();
+            }
+          });
+        });
+      };
+      
+      // Initialize canvas with proper dimensions
+      nodeType.prototype.initializeCanvas = function(canvas, ctx) {
+        if (!canvas) return;
+        
+        // Use requestAnimationFrame for proper timing
+        requestAnimationFrame(() => {
+          this.updateCanvasSize(canvas);
+          // Initial draw
+          if (this.drawChart) {
             this.drawChart();
           }
-        }, 200);
+        });
       };
       
       // Setup zoom handling for LiteGraph compatibility
-      nodeType.prototype.setupZoomHandling = function(canvas, ctx, resizeCallback) {
-        // Simple approach: just handle resize events
+      nodeType.prototype.setupZoomHandling = function(canvas, ctx) {
+        // Store reference to original onResize if it exists
         const originalOnResize = this.onResize;
+        
+        // Implement proper onResize handler with debouncing
         this.onResize = function(size) {
+          // Detect if this is a manual resize by the user vs programmatic resize
+          if (!this.programmaticResize) {
+            // User manually resized the node - respect their choice
+            this.userHasManuallyResized = true;
+          }
+          
+          // Call original onResize if it exists
           if (originalOnResize) {
             originalOnResize.call(this, size);
           }
           
-          // Simple delayed redraw
-          setTimeout(() => {
-            if (this.displayMode === 'individual' && this.individualCanvases) {
-              this.updateIndividualCharts();
-            } else if (this.drawChart) {
-              this.drawChart();
+          // Debounce resize events to prevent spam
+          if (this.resizeDebounceTimeout) {
+            clearTimeout(this.resizeDebounceTimeout);
+          }
+          
+          this.resizeDebounceTimeout = setTimeout(() => {
+            try {
+              // Update canvas sizes based on new node size
+              if (this.chartCanvas && this.displayMode !== 'individual') {
+                // Reinitialize the canvas properly
+                this.updateCanvasSize(this.chartCanvas);
+                
+                // Make sure context is still valid
+                if (this.chartContext) {
+                  this.drawChart();
+                }
+              } else if (this.individualCanvases) {
+                // Force DOM to recalculate layout
+                setTimeout(() => {
+                  // Update all individual canvases
+                  Object.values(this.individualCanvases).forEach(({ canvas, ctx, resource }, index) => {
+                    if (canvas && ctx) {
+                      // Get the canvas container to check its size
+                      const container = canvas.parentElement;
+                      if (container) {
+                        // Force canvas to match container size by removing existing styles
+                        canvas.removeAttribute('style');
+                        canvas.style.width = '100%';
+                        canvas.style.height = '50px';
+                        canvas.style.display = 'block';
+                        
+                        // Force reflow
+                        canvas.offsetHeight;
+                        
+                        // Update canvas buffer size
+                        this.updateCanvasSize(canvas);
+                      }
+                    }
+                  });
+                  
+                  // Draw charts after all canvases are updated
+                  setTimeout(() => {
+                    this.updateIndividualCharts();
+                  }, 100);
+                }, 50);
+              }
+              
+              // Update any canvases that were passed directly
+              if (canvas && canvas !== this.chartCanvas) {
+                this.updateCanvasSize(canvas);
+              }
+              
+              // Restart chart updates if they stopped
+              if (!this.chartUpdateInterval) {
+                this.startChartUpdates();
+              }
+              
+              // CRITICAL: Force immediate chart redraw after resize
+              requestAnimationFrame(() => {
+                if (this.displayMode === 'individual' && this.individualCanvases) {
+                  this.updateIndividualCharts();
+                } else if (this.chartCanvas && this.chartContext) {
+                  this.drawChart();
+                }
+              });
+              
+            } catch (error) {
+              console.error("Error during resize handling:", error);
+              // Try to restart everything if there was an error
+              this.restartChartSystem();
             }
-          }, 100);
+          }, 100); // 100ms debounce
         };
       };
 
       // Draw the resource chart (combined stacked view like ss.png)
       nodeType.prototype.drawChart = function() {
         if (!this.chartContext || !this.chartCanvas) {
-          console.log("📊 Chart context or canvas missing");
           return;
         }
         
-        // Drawing chart from single source of truth
-        
         const ctx = this.chartContext;
         const canvas = this.chartCanvas;
-        const width = canvas.width;
-        const height = canvas.height;
+        
+        // Use the display size, not the actual canvas buffer size
+        const rect = canvas.getBoundingClientRect();
+        const width = rect.width;
+        const height = rect.height;
+        
+        // Skip if canvas has no size or context is invalid
+        if (width === 0 || height === 0) {
+          return;
+        }
+        
+        // Validate context is still working
+        try {
+          ctx.save();
+        } catch (e) {
+          this.chartContext = canvas.getContext('2d');
+          return;
+        }
         
         // Clear canvas
         ctx.clearRect(0, 0, width, height);
@@ -1114,6 +1496,9 @@ app.registerExtension({
           
           ctx.stroke();
         });
+        
+        // Restore context state
+        ctx.restore();
       };
       
       // Load settings from localStorage
@@ -1249,11 +1634,13 @@ app.registerExtension({
       // Draw the resource chart (combined stacked view like ss.png)
       nodeType.prototype.drawChart = function() {
         if (!this.chartContext || !this.chartCanvas) {
-          console.log("📊 Chart context or canvas missing");
           return;
         }
         
-        console.log("📊 Drawing chart, mode:", this.displayMode);
+        // Skip this function if we're in individual mode - it should use updateIndividualCharts instead
+        if (this.displayMode === 'individual') {
+          return;
+        }
         
         const ctx = this.chartContext;
         const canvas = this.chartCanvas;
@@ -1419,6 +1806,8 @@ app.registerExtension({
           if (this.nodeListDiv) {
             this.nodeListDiv.innerHTML = '<div style="color: #666;">Run a workflow to see per-node stats</div>';
           }
+          // Recalculate size even when clearing the list
+          this.calculateAndSetNodeSize();
           return;
         }
 
@@ -1459,11 +1848,16 @@ app.registerExtension({
         }).join('');
 
         this.nodeListDiv.innerHTML = nodeHtml || '<div style="color: #666;">No node data available</div>';
+        
+        // Use requestAnimationFrame to ensure DOM is updated before measuring
+        requestAnimationFrame(() => {
+          // Recalculate node size after content changes
+          this.calculateAndSetNodeSize();
+        });
       };
 
       // Add a completed node to the display (restored functionality)
       nodeType.prototype.addCompletedNode = function(nodeMetrics) {
-        console.log("📊 Adding completed node to display:", nodeMetrics);
         
         // Update node list immediately
         if (this.nodeListDiv) {
@@ -1474,7 +1868,6 @@ app.registerExtension({
 
       // Update completed nodes display (restored functionality)
       nodeType.prototype.updateCompletedNodes = function() {
-        console.log("📊 Updating completed nodes display");
         
         // Update node list with all completed nodes
         if (this.nodeListDiv) {
@@ -1487,7 +1880,6 @@ app.registerExtension({
       nodeType.prototype.rebuildInterface = function() {
         if (!this.container) return;
         
-        console.log("🌡️ REBUILD: Rebuilding interface - this may reset temperature display");
         // Rebuilding interface
         
         if (this.displayMode === 'individual') {
@@ -1536,18 +1928,11 @@ app.registerExtension({
         this.chartCanvas = canvas;
         this.chartContext = ctx;
         
-        // Set canvas size (simplified approach)
-        const resizeCanvas = () => {
-          const rect = canvas.getBoundingClientRect();
-          canvas.width = rect.width;
-          canvas.height = rect.height;
-          canvas.style.width = rect.width + 'px';
-          canvas.style.height = rect.height + 'px';
-        };
-        setTimeout(resizeCanvas, 100);
+        // Initialize canvas with proper sizing
+        this.initializeCanvas(canvas, ctx);
         
         // Setup zoom handling for this canvas too
-        this.setupZoomHandling(canvas, ctx, resizeCanvas);
+        this.setupZoomHandling(canvas, ctx);
         
         this.updateChart();
         
@@ -1566,6 +1951,9 @@ app.registerExtension({
         chartContainer.innerHTML = '';
         chartContainer.style.height = 'auto';
         chartContainer.style.padding = '8px';
+        chartContainer.style.maxHeight = '400px';
+        chartContainer.style.overflowY = 'auto';
+        chartContainer.style.overflowX = 'hidden';
         
         // Resource definitions
         const resourceDefs = {
@@ -1587,11 +1975,12 @@ app.registerExtension({
               panelDiv.style.cssText = `
                 background: rgba(0,0,0,0.2);
                 border-radius: 4px;
-                padding: 8px;
-                margin-bottom: 8px;
+                padding: 6px;
+                margin-bottom: 6px;
                 border-left: 3px solid ${resource.color};
                 position: relative;
-                height: 80px;
+                height: 70px;
+                flex-shrink: 0;
               `;
               
               panelDiv.innerHTML = `
@@ -1610,7 +1999,7 @@ app.registerExtension({
                 </div>
                 <canvas id="${panelId}Chart" style="
                   width: 100%;
-                  height: 60px;
+                  height: 50px;
                   display: block;
                 "></canvas>
               `;
@@ -1622,22 +2011,14 @@ app.registerExtension({
               const ctx = canvas.getContext('2d');
               this.individualCanvases[panelId] = { canvas, ctx, resource };
               
-              // Set canvas size (simplified approach)
-              setTimeout(() => {
-                const rect = canvas.getBoundingClientRect();
-                canvas.width = rect.width;
-                canvas.height = rect.height;
-                canvas.style.width = rect.width + 'px';
-                canvas.style.height = rect.height + 'px';
-              }, 100);
+              // Initialize canvas with proper sizing
+              this.initializeCanvas(canvas, ctx);
             }
           }
         });
         
-        // Update node size for individual panels
-        const panelCount = this.enabledPanels.length;
-        const newHeight = 300 + (panelCount * 100); // Base height + panels
-        this.size = [380, Math.min(newHeight, 600)]; // Cap at 600px height
+        // Recalculate node size for new mode
+        this.calculateAndSetNodeSize();
         
         this.updateIndividualCharts();
         
@@ -1649,9 +2030,9 @@ app.registerExtension({
       
       // Update individual charts
       nodeType.prototype.updateIndividualCharts = function() {
-        if (!this.individualCanvases) return;
-        
-        // Updating individual charts
+        if (!this.individualCanvases) {
+          return;
+        }
         
         Object.keys(this.individualCanvases).forEach(panelId => {
           const { canvas, ctx, resource } = this.individualCanvases[panelId];
@@ -1662,6 +2043,10 @@ app.registerExtension({
           const rect = canvas.getBoundingClientRect();
           const width = rect.width;
           const height = rect.height;
+          
+          if (width === 0 || height === 0) {
+            return; // Skip if not visible
+          }
           
           // Clear canvas
           ctx.clearRect(0, 0, width, height);
@@ -1758,11 +2143,9 @@ app.registerExtension({
         if (this.latestMonitorData && this.latestMonitorData.gpu && this.latestMonitorData.system) {
           // Returning fresh monitoring data
           
-          // TEMPORARY DEBUG: If temperature is 0, supplement with mock temperature
+          // If temperature is 0, supplement with mock temperature
           if (this.latestMonitorData.gpu && this.latestMonitorData.gpu.temperature === 0) {
-            console.log("📊 WARNING: Backend provided 0°C temperature - supplementing with mock data");
             this.latestMonitorData.gpu.temperature = Math.floor(Math.random() * 25) + 45; // 45-70°C
-            console.log(`📊 Using mock temperature: ${this.latestMonitorData.gpu.temperature}°C`);
           }
           
           return this.latestMonitorData;
@@ -1802,57 +2185,9 @@ app.registerExtension({
         return mockData;
       };
 
-      // Update the node performance list
-      nodeType.prototype.updateNodeList = function(nodeMetrics) {
-        if (!this.nodeListDiv || !nodeMetrics || nodeMetrics.length === 0) {
-          if (this.nodeListDiv) {
-            this.nodeListDiv.innerHTML = '<div style="color: #666;">Run a workflow to see per-node stats</div>';
-          }
-          return;
-        }
-
-        // Build node list HTML
-        const nodeHtml = nodeMetrics.map(node => {
-          const duration = (node.duration_ms / 1000).toFixed(1);
-          const nodeTitle = node.node_title || node.node_type || `Node ${node.node_id}`;
-          
-          // Format the performance display
-          let perfText = '';
-          if (node.avg_cpu_percent > 0 || node.avg_gpu_utilization > 0) {
-            const cpuText = node.avg_cpu_percent > 0 ? `${node.avg_cpu_percent.toFixed(1)}% CPU` : '';
-            const gpuText = node.avg_gpu_utilization > 0 ? `${node.avg_gpu_utilization.toFixed(1)}% GPU` : '';
-            const parts = [cpuText, gpuText].filter(p => p);
-            perfText = parts.join(', ');
-          } else {
-            perfText = 'No activity';
-          }
-          
-          return `
-            <div style="
-              display: flex; 
-              justify-content: space-between; 
-              align-items: center;
-              padding: 2px 0;
-              border-bottom: 1px solid #333;
-              margin-bottom: 2px;
-            ">
-              <div style="color: #81c784; font-weight: bold; max-width: 120px; overflow: hidden; text-overflow: ellipsis;">
-                ${nodeTitle}
-              </div>
-              <div style="color: #fff; text-align: right; font-size: 9px;">
-                ${perfText}
-                <div style="color: #888;">(${duration}s)</div>
-              </div>
-            </div>
-          `;
-        }).join('');
-
-        this.nodeListDiv.innerHTML = nodeHtml || '<div style="color: #666;">No node data available</div>';
-      };
 
       // Add a completed node to the display
       nodeType.prototype.addCompletedNode = function(nodeMetrics) {
-        console.log("📊 Adding completed node to display:", nodeMetrics);
         
         // Update node list immediately
         if (this.nodeListDiv) {
@@ -1863,7 +2198,6 @@ app.registerExtension({
 
       // Update completed nodes display (called after workflow finishes)
       nodeType.prototype.updateCompletedNodes = function() {
-        console.log("📊 Updating completed nodes display");
         
         // Update node list with all completed nodes
         if (this.nodeListDiv) {
@@ -1876,6 +2210,472 @@ app.registerExtension({
       nodeType.prototype.startMonitoringUpdates = function() {
         // The display will update when the workflow executes
         // via the onExecuted callback
+      };
+
+      // Create popout window for charts
+      nodeType.prototype.createPopoutWindow = function() {
+        if (this.isChartsPoppedOut) return;
+
+        // Create the popout overlay
+        this.popoutWindow = document.createElement('div');
+        this.popoutWindow.style.cssText = `
+          position: fixed;
+          top: 50px;
+          left: 50px;
+          width: 600px;
+          height: 400px;
+          background: rgba(42, 42, 42, 0.95);
+          border: 1px solid #404040;
+          border-radius: 8px;
+          z-index: 10000;
+          box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+          backdrop-filter: blur(10px);
+          resize: both;
+          overflow: hidden;
+          min-width: 300px;
+          min-height: 200px;
+          font-family: 'Segoe UI', monospace;
+          color: #ffffff;
+        `;
+
+        // Create header with close button
+        const header = document.createElement('div');
+        header.style.cssText = `
+          background: rgba(76, 195, 247, 0.1);
+          padding: 8px 12px;
+          border-bottom: 1px solid #404040;
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          cursor: move;
+        `;
+        header.innerHTML = `
+          <span style="color: #4fc3f7; font-weight: bold; font-size: 14px;">📊 Resource Monitor - Charts</span>
+          <button id="popoutClose" style="
+            background: #666;
+            color: white;
+            border: none;
+            width: 20px;
+            height: 20px;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+          ">✕</button>
+        `;
+
+        // Create content area for charts
+        const content = document.createElement('div');
+        content.style.cssText = `
+          padding: 12px;
+          height: calc(100% - 50px);
+          overflow: hidden;
+        `;
+
+        this.popoutWindow.appendChild(header);
+        this.popoutWindow.appendChild(content);
+        document.body.appendChild(this.popoutWindow);
+
+        // Make draggable
+        this.makeElementDraggable(this.popoutWindow, header);
+
+        // Add close button functionality
+        const closeBtn = header.querySelector('#popoutClose');
+        closeBtn.onclick = () => this.closePopoutWindow();
+
+        // Handle popout window resize
+        const resizeObserver = new ResizeObserver(() => {
+          if (this.popoutCanvas) {
+            requestAnimationFrame(() => {
+              this.updateCanvasSize(this.popoutCanvas);
+              this.drawPopoutChart();
+            });
+          } else if (this.popoutIndividualCanvases) {
+            requestAnimationFrame(() => {
+              Object.values(this.popoutIndividualCanvases).forEach(({ canvas }) => {
+                this.updateCanvasSize(canvas);
+              });
+              this.updatePopoutIndividualCharts();
+            });
+          }
+        });
+        resizeObserver.observe(this.popoutWindow);
+        this.popoutResizeObserver = resizeObserver;
+
+        // Move charts to popout
+        this.moveChartsToPopout(content);
+
+        // Update state and button
+        this.isChartsPoppedOut = true;
+        this.updatePopoutButtonText();
+        
+        // Resize node to remove chart space
+        this.calculateAndSetNodeSize();
+      };
+
+      // Close popout window and restore charts to node
+      nodeType.prototype.closePopoutWindow = function() {
+        if (!this.isChartsPoppedOut || !this.popoutWindow) return;
+
+        // Move charts back to node
+        this.moveChartsBackToNode();
+
+        // Clean up resize observer
+        if (this.popoutResizeObserver) {
+          this.popoutResizeObserver.disconnect();
+          this.popoutResizeObserver = null;
+        }
+
+        // Remove popout window
+        document.body.removeChild(this.popoutWindow);
+        this.popoutWindow = null;
+
+        // Update state and button
+        this.isChartsPoppedOut = false;
+        this.updatePopoutButtonText();
+        
+        // Resize node to include chart space again
+        this.calculateAndSetNodeSize();
+      };
+
+      // Move charts from node to popout
+      nodeType.prototype.moveChartsToPopout = function(popoutContent) {
+        if (!this.container) return;
+
+        // Create chart container in popout
+        const chartDiv = document.createElement('div');
+        chartDiv.id = 'popoutChartContainer';
+        chartDiv.style.cssText = `
+          background: #1a1a1a;
+          border-radius: 4px;
+          padding: 12px;
+          height: 100%;
+          position: relative;
+        `;
+
+        if (this.displayMode === 'individual') {
+          // Move individual charts
+          chartDiv.style.overflowY = 'auto';
+          this.createPopoutIndividualCharts(chartDiv);
+        } else {
+          // Move combined chart
+          chartDiv.innerHTML = `
+            <canvas id="popoutChart" style="width: 100%; height: calc(100% - 40px);"></canvas>
+            <div style="position: absolute; bottom: 8px; left: 12px; color: #666; font-size: 10px;">60 SECONDS</div>
+            <div style="position: absolute; right: 12px; top: 12px; text-align: right;">
+              <div style="color: #666; font-size: 10px;">100</div>
+              <div style="color: #666; font-size: 10px; position: absolute; bottom: 12px; right: 0;">0</div>
+            </div>
+          `;
+          
+          // Initialize popout canvas
+          const popoutCanvas = chartDiv.querySelector('#popoutChart');
+          const popoutCtx = popoutCanvas.getContext('2d');
+          this.popoutCanvas = popoutCanvas;
+          this.popoutContext = popoutCtx;
+          
+          requestAnimationFrame(() => {
+            this.updateCanvasSize(popoutCanvas);
+            this.drawPopoutChart();
+          });
+        }
+
+        popoutContent.appendChild(chartDiv);
+        
+        // Hide original charts in node
+        const originalChartContainer = this.container.querySelector('#chartContainer');
+        if (originalChartContainer) {
+          originalChartContainer.style.display = 'none';
+        }
+      };
+
+      // Move charts back from popout to node
+      nodeType.prototype.moveChartsBackToNode = function() {
+        if (!this.container) return;
+
+        // Show original charts in node
+        const originalChartContainer = this.container.querySelector('#chartContainer');
+        if (originalChartContainer) {
+          originalChartContainer.style.display = 'block';
+        }
+
+        // Clean up popout chart references
+        this.popoutCanvas = null;
+        this.popoutContext = null;
+        this.popoutIndividualCanvases = null;
+
+        // Restore chart functionality in node
+        if (this.displayMode === 'individual') {
+          this.buildIndividualCharts();
+        } else {
+          this.buildCombinedChart();
+        }
+      };
+
+      // Create individual charts in popout
+      nodeType.prototype.createPopoutIndividualCharts = function(container) {
+        const resourceDefs = {
+          cpu: { name: 'CPU', color: '#4fc3f7', data: 'cpuHistory', unit: '%' },
+          gpu: { name: 'GPU', color: '#81c784', data: 'gpuHistory', unit: '%' },
+          vram: { name: 'VRAM', color: '#ff9800', data: 'vramHistory', unit: '%' },
+          ram: { name: 'RAM', color: '#e91e63', data: 'ramHistory', unit: '%' },
+          temp: { name: 'TEMP', color: '#f44336', data: 'tempHistory', unit: '°C' }
+        };
+
+        this.popoutIndividualCanvases = {};
+
+        this.panelOrder.forEach(panelId => {
+          if (this.enabledPanels.includes(panelId)) {
+            const resource = resourceDefs[panelId];
+            if (resource) {
+              const panelDiv = document.createElement('div');
+              panelDiv.style.cssText = `
+                background: rgba(0,0,0,0.2);
+                border-radius: 4px;
+                padding: 6px;
+                margin-bottom: 6px;
+                border-left: 3px solid ${resource.color};
+                position: relative;
+                height: 70px;
+                flex-shrink: 0;
+              `;
+
+              panelDiv.innerHTML = `
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                  <span style="color: ${resource.color}; font-weight: bold; font-size: 11px;">${resource.name}</span>
+                  <span id="popout${panelId}Value" style="color: #fff; font-size: 14px; font-weight: bold;">0${resource.unit}</span>
+                </div>
+                <canvas id="popout${panelId}Chart" style="width: 100%; height: 50px; display: block;"></canvas>
+              `;
+
+              container.appendChild(panelDiv);
+
+              const canvas = panelDiv.querySelector(`#popout${panelId}Chart`);
+              const ctx = canvas.getContext('2d');
+              this.popoutIndividualCanvases[panelId] = { canvas, ctx, resource };
+
+              requestAnimationFrame(() => {
+                this.updateCanvasSize(canvas);
+              });
+            }
+          }
+        });
+      };
+
+      // Draw chart in popout window
+      nodeType.prototype.drawPopoutChart = function() {
+        if (!this.popoutContext || !this.popoutCanvas) return;
+
+        const ctx = this.popoutContext;
+        const canvas = this.popoutCanvas;
+        const rect = canvas.getBoundingClientRect();
+        const width = rect.width;
+        const height = rect.height;
+
+        if (width === 0 || height === 0) return;
+
+        // Clear canvas
+        ctx.clearRect(0, 0, width, height);
+
+        // Draw grid
+        ctx.strokeStyle = '#333';
+        ctx.lineWidth = 1;
+
+        // Horizontal grid lines
+        for (let i = 0; i <= 4; i++) {
+          const y = (height / 4) * i;
+          ctx.beginPath();
+          ctx.moveTo(0, y);
+          ctx.lineTo(width, y);
+          ctx.stroke();
+        }
+
+        // Vertical grid lines
+        for (let i = 0; i <= 6; i++) {
+          const x = (width / 6) * i;
+          ctx.beginPath();
+          ctx.moveTo(x, 0);
+          ctx.lineTo(x, height);
+          ctx.stroke();
+        }
+
+        // Draw resource lines
+        const resources = [
+          { name: 'CPU', data: this.cpuHistory, color: '#4fc3f7' },
+          { name: 'GPU', data: this.gpuHistory, color: '#81c784' },
+          { name: 'VRAM', data: this.vramHistory, color: '#ff9800' },
+          { name: 'RAM', data: this.ramHistory, color: '#e91e63' },
+          { name: 'TEMP', data: this.tempHistory, color: '#f44336' }
+        ];
+
+        const enabledResources = resources.filter(r => this.enabledPanels.includes(r.name.toLowerCase()));
+        const stepX = width / 60;
+
+        enabledResources.forEach((resource) => {
+          ctx.strokeStyle = resource.color;
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+
+          for (let i = 0; i < resource.data.length; i++) {
+            const x = i * stepX;
+            const y = height - (resource.data[i] / 100) * height;
+
+            if (i === 0) {
+              ctx.moveTo(x, y);
+            } else {
+              ctx.lineTo(x, y);
+            }
+          }
+
+          ctx.stroke();
+        });
+      };
+
+      // Update popout button text based on state
+      nodeType.prototype.updatePopoutButtonText = function() {
+        if (!this.container) return;
+        
+        const popoutBtn = this.container.querySelector('#popoutBtn');
+        if (popoutBtn) {
+          popoutBtn.textContent = this.isChartsPoppedOut ? '📥 Restore' : '🖼️ Popout';
+        }
+      };
+
+      // Update individual charts in popout
+      nodeType.prototype.updatePopoutIndividualCharts = function() {
+        if (!this.popoutIndividualCanvases) return;
+
+        Object.keys(this.popoutIndividualCanvases).forEach(panelId => {
+          const { canvas, ctx, resource } = this.popoutIndividualCanvases[panelId];
+          const data = this[resource.data];
+          
+          if (!canvas || !ctx || !data) return;
+          
+          const rect = canvas.getBoundingClientRect();
+          const width = rect.width;
+          const height = rect.height;
+          
+          if (width === 0 || height === 0) return;
+          
+          // Clear canvas
+          ctx.clearRect(0, 0, width, height);
+          
+          // Draw grid lines
+          ctx.strokeStyle = '#333';
+          ctx.lineWidth = 1;
+          
+          // Horizontal lines
+          for (let i = 0; i <= 2; i++) {
+            const y = (height / 2) * i;
+            ctx.beginPath();
+            ctx.moveTo(0, y);
+            ctx.lineTo(width, y);
+            ctx.stroke();
+          }
+          
+          // Draw data line
+          ctx.strokeStyle = resource.color;
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          
+          const stepX = width / 60;
+          for (let i = 0; i < data.length; i++) {
+            const x = i * stepX;
+            const y = height - (data[i] / 100) * height;
+            
+            if (i === 0) {
+              ctx.moveTo(x, y);
+            } else {
+              ctx.lineTo(x, y);
+            }
+          }
+          
+          ctx.stroke();
+          
+          // Update value display
+          const valueEl = this.popoutWindow.querySelector(`#popout${panelId}Value`);
+          if (valueEl) {
+            const currentValue = Math.round(this.currentResourceData[panelId]?.value || 0);
+            valueEl.textContent = currentValue + resource.unit;
+          }
+        });
+      };
+
+      // Make element draggable
+      nodeType.prototype.makeElementDraggable = function(element, handle) {
+        let isDragging = false;
+        let dragOffset = { x: 0, y: 0 };
+
+        handle.addEventListener('mousedown', (e) => {
+          isDragging = true;
+          const rect = element.getBoundingClientRect();
+          dragOffset.x = e.clientX - rect.left;
+          dragOffset.y = e.clientY - rect.top;
+          e.preventDefault();
+        });
+
+        document.addEventListener('mousemove', (e) => {
+          if (!isDragging) return;
+          
+          element.style.left = (e.clientX - dragOffset.x) + 'px';
+          element.style.top = (e.clientY - dragOffset.y) + 'px';
+        });
+
+        document.addEventListener('mouseup', () => {
+          isDragging = false;
+        });
+      };
+
+      // Add context menu options
+      nodeType.prototype.getMenuOptions = function() {
+        const options = [];
+        
+        if (this.userHasManuallyResized) {
+          options.push({
+            content: "🔄 Reset to Auto-sizing",
+            callback: () => {
+              this.userHasManuallyResized = false;
+              this.calculateAndSetNodeSize();
+            }
+          });
+        }
+        
+        return options;
+      };
+
+      // Cleanup when node is removed
+      nodeType.prototype.onRemoved = function() {
+        // Close popout window if open
+        if (this.isChartsPoppedOut && this.popoutWindow) {
+          this.closePopoutWindow();
+        }
+        
+        // Clean up resize observer
+        if (this.resizeObserver) {
+          this.resizeObserver.disconnect();
+          this.resizeObserver = null;
+        }
+        
+        // Clear timeouts
+        if (this.resizeTimeout) {
+          clearTimeout(this.resizeTimeout);
+        }
+        if (this.updateInterval) {
+          clearInterval(this.updateInterval);
+        }
+        if (this.chartUpdateInterval) {
+          clearInterval(this.chartUpdateInterval);
+        }
+        
+        // Remove from global registry
+        if (window.resourceMonitorNodes) {
+          const index = window.resourceMonitorNodes.indexOf(this);
+          if (index > -1) {
+            window.resourceMonitorNodes.splice(index, 1);
+          }
+        }
       };
     }
   }
