@@ -20,7 +20,7 @@ class ComfyAssetsBaseNode:
     - Consistent return type handling
     """
 
-    CATEGORY = "ComfyAssets"
+    CATEGORY = "🫶 ComfyAssets/🛠️ Utils"
 
     def validate_inputs(self, **kwargs) -> None:
         """
