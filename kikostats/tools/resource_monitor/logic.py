@@ -692,6 +692,18 @@ class ContinuousResourceMonitor:
         
         return None
     
+    def send_workflow_complete(self, total_execution_time: float):
+        """Send workflow completion event with total execution time"""
+        if COMFYUI_SERVER_AVAILABLE and PromptServer.instance:
+            try:
+                PromptServer.instance.send_sync('kikostats.workflow_complete', {
+                    'total_execution_time': total_execution_time,
+                    'timestamp': time.time()
+                })
+                print(f"[KikoStats] Workflow completed in {total_execution_time:.2f}s")
+            except Exception as e:
+                print(f"[KikoStats] Error sending workflow complete event: {e}")
+    
     def _process_js_tracking_commands(self):
         """Process node tracking commands from JavaScript frontend"""
         # This is a simple approach - in a real implementation you'd use proper IPC
