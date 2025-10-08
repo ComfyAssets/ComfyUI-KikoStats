@@ -81,6 +81,9 @@ def install_execution_hooks():
             def wrapped_execute(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
                 """Wrapped execute method that tracks nodes"""
                 
+                # Track total workflow execution time
+                workflow_start_time = time.time()
+                
                 # Store original methods for node execution
                 if hasattr(self, 'execute_node'):
                     original_execute_node = self.execute_node
@@ -107,7 +110,22 @@ def install_execution_hooks():
                     self.execute_node = wrapped_execute_node
                 
                 # Call original execute
-                return original_execute(self, prompt, prompt_id, extra_data, execute_outputs)
+                try:
+                    result = original_execute(self, prompt, prompt_id, extra_data, execute_outputs)
+                    return result
+                finally:
+                    # Calculate total workflow execution time
+                    workflow_end_time = time.time()
+                    total_execution_time = workflow_end_time - workflow_start_time
+                    
+                    # Send workflow completion event with execution time
+                    try:
+                        from .tools.resource_monitor.logic import get_global_monitor
+                        monitor = get_global_monitor()
+                        if hasattr(monitor, 'send_workflow_complete'):
+                            monitor.send_workflow_complete(total_execution_time)
+                    except Exception as e:
+                        print(f"[KikoStats] Error sending workflow complete event: {e}")
             
             # Replace the method
             execution.PromptExecutor.execute = wrapped_execute
