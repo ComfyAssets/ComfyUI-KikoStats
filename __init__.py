@@ -14,7 +14,7 @@ except ImportError:
     from kikostats import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
 # Tell ComfyUI where to find our JavaScript extensions
-WEB_DIRECTORY = "./web"
+WEB_DIRECTORY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 
 
 def get_version():
