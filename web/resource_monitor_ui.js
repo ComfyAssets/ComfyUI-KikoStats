@@ -7,6 +7,19 @@ app.registerExtension({
 
   async setup() {
     console.log("🚀 KikoStats ResourceMonitor extension loaded");
+
+    // Load Chart.js from CDN if not already loaded
+    if (typeof Chart === 'undefined') {
+      await new Promise((resolve, reject) => {
+        const script = document.createElement('script');
+        script.src = 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js';
+        script.onload = resolve;
+        script.onerror = reject;
+        document.head.appendChild(script);
+      });
+      console.log("📊 Chart.js library loaded");
+    }
+
     // Store reference to all ResourceMonitor nodes
     window.resourceMonitorNodes = window.resourceMonitorNodes || [];
     
@@ -34,6 +47,16 @@ app.registerExtension({
       window.resourceMonitorNodes.forEach((monitorNode) => {
         if (monitorNode.addNodeMetric) {
           monitorNode.addNodeMetric(event.detail);
+        }
+      });
+    });
+
+    // Listen for workflow completion with total execution time
+    api.addEventListener("kikostats.workflow_complete", (event) => {
+      // Workflow completed - update all ResourceMonitor nodes with total time
+      window.resourceMonitorNodes.forEach((monitorNode) => {
+        if (monitorNode.setWorkflowExecutionTime) {
+          monitorNode.setWorkflowExecutionTime(event.detail.total_execution_time);
         }
       });
     });
@@ -263,6 +286,9 @@ app.registerExtension({
         this.monitoringActive = false;
         this.monitorData = null;
         
+        // Initialize workflow tracking
+        this.totalWorkflowExecutionTime = null;
+        
         // Initialize resize tracking flags
         this.userHasManuallyResized = false;
         this.programmaticResize = false;
@@ -295,7 +321,10 @@ app.registerExtension({
         this.ramHistory = new Array(60).fill(0);
         this.tempHistory = new Array(60).fill(0);
         this.historyIndex = 0;
-        
+
+        // Chart.js instances storage
+        this.chartInstances = {};
+
         // SINGLE SOURCE OF TRUTH - Current resource values
         this.currentResourceData = {
           cpu: { value: 0, available: false },
@@ -321,12 +350,26 @@ app.registerExtension({
           widgetOptions
         );
 
-        // Calculate and set initial node size after DOM is ready
-        requestAnimationFrame(() => {
-          this.calculateAndSetNodeSize();
-        });
+        // Set initial size
+        this.size = [420, 700];
 
-        // Setup resize observer for dynamic sizing
+        // Simple resize handler with constraints (Checkpoint Discovery Hub pattern)
+        const MIN_W = 400, MIN_H = 600;
+        this.onResize = function(size) {
+          if (size[0] < MIN_W) size[0] = MIN_W;
+          if (size[1] < MIN_H) size[1] = MIN_H;
+
+          // Resize Chart.js instances if they exist
+          if (this.chartInstances && this.chartInstances.main) {
+            requestAnimationFrame(() => {
+              this.chartInstances.main.resize();
+            });
+          }
+
+          return size;
+        };
+
+        // Setup resize observer for dynamic content sizing
         this.setupResizeObserver(uiContainer);
 
         // Start monitoring updates
@@ -411,7 +454,8 @@ app.registerExtension({
         }
         
         // Return computed size with higher cap for individual mode
-        const maxHeight = this.displayMode === 'individual' ? 1000 : 850;
+        // Increase max height to accommodate more nodes
+        const maxHeight = this.displayMode === 'individual' ? 1200 : 1000;
         return [width, Math.min(totalHeight, maxHeight)];
       };
 
@@ -501,8 +545,12 @@ app.registerExtension({
             const nodeListClientHeight = nodeListEl.clientHeight;
             const nodeListOffsetTop = nodeListEl.offsetTop;
             
-            // Calculate total needed height: everything above node list + actual node list height
-            const calculatedHeight = nodeListOffsetTop + nodeListScrollHeight + 20; // Add bottom padding
+            // Cap nodeList height at max-height (400px) since it scrolls beyond that
+            const nodeListMaxHeight = 400;
+            const effectiveNodeListHeight = Math.min(nodeListScrollHeight, nodeListMaxHeight);
+            
+            // Calculate total needed height: everything above node list + effective node list height
+            const calculatedHeight = nodeListOffsetTop + effectiveNodeListHeight + 20; // Add bottom padding
             
             return calculatedHeight;
           }
@@ -553,26 +601,53 @@ app.registerExtension({
         }
       };
       
+      // Prepare canvas context for crisp DPI-aware rendering
+      nodeType.prototype.prepareCanvasContext = function(canvas, ctx) {
+        const dpr = window.devicePixelRatio || 1;
+        
+        // Reset transform to avoid accumulation
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        
+        // Scale for device pixel ratio - this makes drawing at logical pixels render crisp
+        ctx.scale(dpr, dpr);
+        
+        // Return logical dimensions for drawing
+        return {
+          width: canvas.width / dpr,
+          height: canvas.height / dpr,
+          dpr: dpr
+        };
+      };
+      
       // Update canvas size properly
       nodeType.prototype.updateCanvasSize = function(canvas) {
         if (!canvas) return;
         
-        const rect = canvas.getBoundingClientRect();
+        // Get parent container dimensions instead of canvas to avoid shrinking spiral
+        const parent = canvas.parentElement;
+        if (!parent) return;
+        
+        const parentRect = parent.getBoundingClientRect();
         const dpr = window.devicePixelRatio || 1;
         
+        // Use parent dimensions minus padding
+        const computedStyle = window.getComputedStyle(parent);
+        const paddingLeft = parseFloat(computedStyle.paddingLeft) || 0;
+        const paddingRight = parseFloat(computedStyle.paddingRight) || 0;
+        const paddingTop = parseFloat(computedStyle.paddingTop) || 0;
+        const paddingBottom = parseFloat(computedStyle.paddingBottom) || 0;
+        
+        const availableWidth = parentRect.width - paddingLeft - paddingRight;
+        const availableHeight = parentRect.height - paddingTop - paddingBottom;
+        
         // Only update if we have actual dimensions
-        if (rect.width > 0 && rect.height > 0) {
-          // Set canvas size accounting for device pixel ratio
-          canvas.width = rect.width * dpr;
-          canvas.height = rect.height * dpr;
+        if (availableWidth > 0 && availableHeight > 0) {
+          // Set canvas buffer size accounting for device pixel ratio
+          canvas.width = availableWidth * dpr;
+          canvas.height = availableHeight * dpr;
           
-          // Scale canvas back down using CSS
-          canvas.style.width = rect.width + 'px';
-          canvas.style.height = rect.height + 'px';
-          
-          // Scale context to match device pixel ratio
-          const ctx = canvas.getContext('2d');
-          ctx.scale(dpr, dpr);
+          // DON'T override CSS - let width: 100% and height: 50px work naturally
+          // The canvas buffer is sized for DPI, CSS handles display size
         }
       };
       
@@ -696,12 +771,16 @@ app.registerExtension({
           percent: tempPercent, // Percentage for graph scaling
           available: stats.gpu?.available || false
         };
-        
+
+        // Debug temperature data
+        console.log(`[KikoStats] Temp data: raw=${tempValue}°C, percent=${tempPercent}%, available=${stats.gpu?.available}`);
+
         // FINAL SAFETY NET: If we still have 0°C at this point, force realistic temp
         if (tempValue === 0 && stats.gpu?.available) {
           const forcedTemp = Math.floor(Math.random() * 25) + 45; // 45-70°C
           this.currentResourceData.temp.value = forcedTemp;
           this.currentResourceData.temp.percent = Math.min((forcedTemp / 90) * 100, 100);
+          console.log(`[KikoStats] Forced temp: ${forcedTemp}°C (${this.currentResourceData.temp.percent}%)`);
         }
         
         this.currentResourceData.timestamp = timestamp;
@@ -721,7 +800,11 @@ app.registerExtension({
         this.gpuHistory[this.historyIndex] = this.currentResourceData.gpu.value;
         this.vramHistory[this.historyIndex] = this.currentResourceData.vram.value;
         this.ramHistory[this.historyIndex] = this.currentResourceData.ram.value;
+        // Store temperature as percentage (0-100) for proper Chart.js scaling
         this.tempHistory[this.historyIndex] = this.currentResourceData.temp.percent;
+
+        console.log(`[KikoStats] History[${this.historyIndex}] - Temp: ${this.currentResourceData.temp.value}°C (${this.currentResourceData.temp.percent}%)`);
+
         this.historyIndex = (this.historyIndex + 1) % 60;
       };
       
@@ -929,7 +1012,7 @@ app.registerExtension({
             padding: 12px;
             margin-bottom: 8px;
             position: relative;
-            height: 120px;
+            height: 250px;
           ">
             <canvas id="resourceChart" style="
               width: 100%;
@@ -961,7 +1044,9 @@ app.registerExtension({
             padding: 8px;
             border: 1px solid #333;
             min-height: 60px;
+            max-height: 400px;
             overflow-x: hidden;
+            overflow-y: auto;
           ">
             <div style="
               display: flex;
@@ -1168,12 +1253,136 @@ app.registerExtension({
           </div>
         `;
 
-        // Initialize chart canvas
+        // Initialize Chart.js for main chart
         const canvas = container.querySelector('#resourceChart');
-        const ctx = canvas.getContext('2d');
         this.chartCanvas = canvas;
-        this.chartContext = ctx;
-        
+
+        // Only initialize Chart.js if Chart library is loaded and canvas exists
+        if (typeof Chart !== 'undefined' && canvas) {
+          try {
+            // Create Chart.js instance with 5 resource datasets
+            this.chartInstances.main = new Chart(canvas.getContext('2d'), {
+          type: 'line',
+          data: {
+            labels: Array(60).fill(''),
+            datasets: [
+              {
+                label: 'GPU',
+                data: this.gpuHistory,
+                borderColor: '#4fc3f7',
+                backgroundColor: '#4fc3f720',
+                borderWidth: 2,
+                fill: true,
+                tension: 0.4,
+                pointRadius: 0
+              },
+              {
+                label: 'VRAM',
+                data: this.vramHistory,
+                borderColor: '#9c27b0',
+                backgroundColor: '#9c27b020',
+                borderWidth: 2,
+                fill: true,
+                tension: 0.4,
+                pointRadius: 0
+              },
+              {
+                label: 'CPU',
+                data: this.cpuHistory,
+                borderColor: '#4caf50',
+                backgroundColor: '#4caf5020',
+                borderWidth: 2,
+                fill: true,
+                tension: 0.4,
+                pointRadius: 0
+              },
+              {
+                label: 'RAM',
+                data: this.ramHistory,
+                borderColor: '#ff9800',
+                backgroundColor: '#ff980020',
+                borderWidth: 2,
+                fill: true,
+                tension: 0.4,
+                pointRadius: 0
+              },
+              {
+                label: 'TEMP',
+                data: this.tempHistory,
+                borderColor: '#f44336',
+                backgroundColor: '#f4433620',
+                borderWidth: 2,
+                fill: true,
+                tension: 0.4,
+                pointRadius: 0
+              }
+            ]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: false,
+            scales: {
+              x: { display: false },
+              y: {
+                display: true,
+                min: 0,
+                max: 100,
+                ticks: {
+                  color: '#666',
+                  font: { size: 10 }
+                },
+                grid: {
+                  color: '#333',
+                  drawBorder: false
+                }
+              }
+            },
+            plugins: {
+              legend: { display: false },
+              tooltip: {
+                enabled: true,
+                mode: 'index',
+                intersect: false,
+                callbacks: {
+                  label: (context) => {
+                    const label = context.dataset.label || '';
+                    let value = context.parsed.y;
+
+                    // For temperature, convert percentage back to °C for display
+                    if (label === 'TEMP') {
+                      value = Math.round((value / 100) * 90);
+                      return `${label}: ${value}°C`;
+                    }
+
+                    return `${label}: ${Math.round(value)}%`;
+                  }
+                }
+              }
+            }
+          }
+        });
+
+            // Force Chart.js to resize to container dimensions
+            setTimeout(() => {
+              if (this.chartInstances.main) {
+                const chartCanvas = this.chartInstances.main.canvas;
+                console.log(`[KikoStats] Chart.js initialized - Canvas size: ${chartCanvas.width}x${chartCanvas.height}, Container: ${canvas.parentElement.offsetWidth}x${canvas.parentElement.offsetHeight}`);
+                this.chartInstances.main.resize();
+                console.log(`[KikoStats] After resize - Canvas size: ${chartCanvas.width}x${chartCanvas.height}`);
+              }
+            }, 100);
+
+          } catch (error) {
+            console.error("Error initializing Chart.js:", error);
+            // Fall back to canvas rendering if Chart.js fails
+            this.chartContext = canvas.getContext('2d');
+          }
+        } else {
+          console.warn("Chart.js not loaded or canvas not found, falling back to manual rendering");
+          this.chartContext = canvas ? canvas.getContext('2d') : null;
+        }
+
         // Initialize history for all resources
         this.vramHistory = new Array(60).fill(0);
         this.ramHistory = new Array(60).fill(0);
@@ -1191,13 +1400,10 @@ app.registerExtension({
         
         // Display mode settings - load from localStorage if available
         this.loadSettings();
-        
-        // Initialize canvas with proper sizing
-        this.initializeCanvas(canvas, ctx);
-        
-        // Handle LiteGraph zoom changes
-        this.setupZoomHandling(canvas, ctx);
-        
+
+        // Chart.js handles canvas sizing automatically
+        // Old canvas initialization not needed with Chart.js
+
         // Add event listeners
         const popoutBtn = container.querySelector('#popoutBtn');
         const settingsBtn = container.querySelector('#settingsBtn');
@@ -1306,14 +1512,21 @@ app.registerExtension({
       nodeType.prototype.initializeCanvas = function(canvas, ctx) {
         if (!canvas) return;
         
-        // Use requestAnimationFrame for proper timing
+        // Use double requestAnimationFrame to ensure layout is complete
         requestAnimationFrame(() => {
-          this.updateCanvasSize(canvas);
-          // Initial draw
-          if (this.drawChart) {
-            this.drawChart();
-          }
+          requestAnimationFrame(() => {
+            this.updateCanvasSize(canvas);
+            // Initial draw
+            if (this.drawChart) {
+              this.drawChart();
+            }
+          });
         });
+        
+        // Also add a fallback resize after a short delay
+        setTimeout(() => {
+          this.updateCanvasSize(canvas);
+        }, 100);
       };
       
       // Setup zoom handling for LiteGraph compatibility
@@ -1411,94 +1624,27 @@ app.registerExtension({
 
       // Draw the resource chart (combined stacked view like ss.png)
       nodeType.prototype.drawChart = function() {
-        if (!this.chartContext || !this.chartCanvas) {
+        // Update Chart.js instead of manual canvas drawing
+        if (!this.chartInstances.main) {
+          console.warn('[KikoStats] Chart.js instance not found in drawChart');
           return;
         }
-        
-        const ctx = this.chartContext;
-        const canvas = this.chartCanvas;
-        
-        // Use the display size, not the actual canvas buffer size
-        const rect = canvas.getBoundingClientRect();
-        const width = rect.width;
-        const height = rect.height;
-        
-        // Skip if canvas has no size or context is invalid
-        if (width === 0 || height === 0) {
-          return;
-        }
-        
-        // Validate context is still working
-        try {
-          ctx.save();
-        } catch (e) {
-          this.chartContext = canvas.getContext('2d');
-          return;
-        }
-        
-        // Clear canvas
-        ctx.clearRect(0, 0, width, height);
-        
-        // Draw grid
-        ctx.strokeStyle = '#333';
-        ctx.lineWidth = 1;
-        
-        // Horizontal grid lines (0%, 25%, 50%, 75%, 100%)
-        for (let i = 0; i <= 4; i++) {
-          const y = (height / 4) * i;
-          ctx.beginPath();
-          ctx.moveTo(0, y);
-          ctx.lineTo(width, y);
-          ctx.stroke();
-        }
-        
-        // Vertical grid lines (every 10 seconds)
-        for (let i = 0; i <= 6; i++) {
-          const x = (width / 6) * i;
-          ctx.beginPath();
-          ctx.moveTo(x, 0);
-          ctx.lineTo(x, height);
-          ctx.stroke();
-        }
-        
-        // Define resources with single source of truth data
-        const resources = [
-          { name: 'CPU', data: this.cpuHistory, color: '#4fc3f7' },
-          { name: 'GPU', data: this.gpuHistory, color: '#81c784' },
-          { name: 'VRAM', data: this.vramHistory, color: '#ff9800' },
-          { name: 'RAM', data: this.ramHistory, color: '#e91e63' },
-          { name: 'TEMP', data: this.tempHistory, color: '#f44336' }
-        ];
-        
-        // Filter enabled resources
-        const enabledResources = resources.filter(r => this.enabledPanels.includes(r.name.toLowerCase()));
-        
-        if (enabledResources.length === 0) return;
-        
-        const stepX = width / 60;
-        
-        // Draw lines for each enabled resource
-        enabledResources.forEach((resource) => {
-          ctx.strokeStyle = resource.color;
-          ctx.lineWidth = 2;
-          ctx.beginPath();
-          
-          for (let i = 0; i < resource.data.length; i++) {
-            const x = i * stepX;
-            const y = height - (resource.data[i] / 100) * height;
-            
-            if (i === 0) {
-              ctx.moveTo(x, y);
-            } else {
-              ctx.lineTo(x, y);
-            }
-          }
-          
-          ctx.stroke();
-        });
-        
-        // Restore context state
-        ctx.restore();
+
+        const chart = this.chartInstances.main;
+
+        // Debug: log current temp data being sent to chart
+        const latestTempIndex = (this.historyIndex - 1 + 60) % 60;
+        console.log(`[KikoStats] drawChart - Latest temp in history[${latestTempIndex}]: ${this.tempHistory[latestTempIndex]}%`);
+
+        // Update all dataset data arrays
+        chart.data.datasets[0].data = [...this.gpuHistory];
+        chart.data.datasets[1].data = [...this.vramHistory];
+        chart.data.datasets[2].data = [...this.cpuHistory];
+        chart.data.datasets[3].data = [...this.ramHistory];
+        chart.data.datasets[4].data = [...this.tempHistory];
+
+        // Update chart without animation for smooth real-time updates
+        chart.update('none');
       };
       
       // Load settings from localStorage
@@ -1644,11 +1790,11 @@ app.registerExtension({
         
         const ctx = this.chartContext;
         const canvas = this.chartCanvas;
-        const rect = canvas.getBoundingClientRect();
-        const width = rect.width;
-        const height = rect.height;
         
-        // Clear canvas
+        // Prepare context for crisp rendering and get logical dimensions
+        const { width, height, dpr } = this.prepareCanvasContext(canvas, ctx);
+        
+        // Clear canvas (uses logical pixels because ctx is scaled)
         ctx.clearRect(0, 0, width, height);
         
         // Draw grid lines
@@ -1800,6 +1946,16 @@ app.registerExtension({
         this.updateChart();
       };
       
+      // Set workflow execution time
+      nodeType.prototype.setWorkflowExecutionTime = function(totalSeconds) {
+        this.totalWorkflowExecutionTime = totalSeconds;
+        
+        // Trigger UI update to display the total time
+        requestAnimationFrame(() => {
+          this.updateNodeList(window.kikoStatsCompletedNodes || []);
+        });
+      };
+      
       // Update the node performance list (restored functionality)
       nodeType.prototype.updateNodeList = function(nodeMetrics) {
         if (!this.nodeListDiv || !nodeMetrics || nodeMetrics.length === 0) {
@@ -1847,7 +2003,26 @@ app.registerExtension({
           `;
         }).join('');
 
-        this.nodeListDiv.innerHTML = nodeHtml || '<div style="color: #666;">No node data available</div>';
+        // Add total workflow execution time if available
+        let totalTimeHtml = '';
+        if (this.totalWorkflowExecutionTime !== null && nodeHtml) {
+          const totalSeconds = this.totalWorkflowExecutionTime;
+          totalTimeHtml = `
+            <div style="
+              margin-top: 8px;
+              padding-top: 8px;
+              border-top: 2px solid #4fc3f7;
+              color: #4fc3f7;
+              font-weight: bold;
+              font-size: 11px;
+              text-align: center;
+            ">
+              ⏱️ Total Workflow Time: ${totalSeconds.toFixed(2)}s
+            </div>
+          `;
+        }
+        
+        this.nodeListDiv.innerHTML = (nodeHtml || '<div style="color: #666;">No node data available</div>') + totalTimeHtml;
         
         // Use requestAnimationFrame to ensure DOM is updated before measuring
         requestAnimationFrame(() => {
@@ -1949,6 +2124,7 @@ app.registerExtension({
         
         // Clear existing content
         chartContainer.innerHTML = '';
+        chartContainer.style.width = '100%';  // Ensure full width
         chartContainer.style.height = 'auto';
         chartContainer.style.padding = '8px';
         chartContainer.style.maxHeight = '400px';
@@ -1980,6 +2156,8 @@ app.registerExtension({
                 border-left: 3px solid ${resource.color};
                 position: relative;
                 height: 70px;
+                width: 100%;
+                box-sizing: border-box;
                 flex-shrink: 0;
               `;
               
@@ -1993,7 +2171,7 @@ app.registerExtension({
                   <span style="color: ${resource.color}; font-weight: bold; font-size: 11px;">
                     ${resource.name}
                   </span>
-                  <span id="${panelId}Value" style="color: #fff; font-size: 14px; font-weight: bold;">
+                  <span id="chart-${panelId}-value" style="color: #fff; font-size: 14px; font-weight: bold;">
                     0${resource.unit}
                   </span>
                 </div>
@@ -2020,12 +2198,17 @@ app.registerExtension({
         // Recalculate node size for new mode
         this.calculateAndSetNodeSize();
         
-        this.updateIndividualCharts();
-        
-        // Restore current values after rebuilding individual charts  
-        setTimeout(() => {
-          this.updateAllUI();
-        }, 50);
+        // Wait for canvases to be initialized before updating charts
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            this.updateIndividualCharts();
+            
+            // Restore current values after rebuilding individual charts  
+            setTimeout(() => {
+              this.updateAllUI();
+            }, 50);
+          });
+        });
       };
       
       // Update individual charts
@@ -2040,15 +2223,14 @@ app.registerExtension({
           
           if (!canvas || !ctx || !data) return;
           
-          const rect = canvas.getBoundingClientRect();
-          const width = rect.width;
-          const height = rect.height;
+          // Prepare context for crisp rendering and get logical dimensions
+          const { width, height, dpr } = this.prepareCanvasContext(canvas, ctx);
           
           if (width === 0 || height === 0) {
             return; // Skip if not visible
           }
           
-          // Clear canvas
+          // Clear canvas (uses logical pixels because ctx is scaled)
           ctx.clearRect(0, 0, width, height);
           
           // Draw grid lines
@@ -2105,7 +2287,7 @@ app.registerExtension({
           ctx.fill();
           
           // Update value display using SINGLE SOURCE OF TRUTH
-          const valueEl = this.container.querySelector(`#${panelId}Value`);
+          const valueEl = this.container.querySelector(`#chart-${panelId}-value`);
           if (valueEl) {
             let displayValue = 0;
             
@@ -2439,6 +2621,8 @@ app.registerExtension({
                 border-left: 3px solid ${resource.color};
                 position: relative;
                 height: 70px;
+                width: 100%;
+                box-sizing: border-box;
                 flex-shrink: 0;
               `;
 
@@ -2470,13 +2654,13 @@ app.registerExtension({
 
         const ctx = this.popoutContext;
         const canvas = this.popoutCanvas;
-        const rect = canvas.getBoundingClientRect();
-        const width = rect.width;
-        const height = rect.height;
+        
+        // Prepare context for crisp rendering and get logical dimensions
+        const { width, height, dpr } = this.prepareCanvasContext(canvas, ctx);
 
         if (width === 0 || height === 0) return;
 
-        // Clear canvas
+        // Clear canvas (uses logical pixels because ctx is scaled)
         ctx.clearRect(0, 0, width, height);
 
         // Draw grid
@@ -2553,13 +2737,12 @@ app.registerExtension({
           
           if (!canvas || !ctx || !data) return;
           
-          const rect = canvas.getBoundingClientRect();
-          const width = rect.width;
-          const height = rect.height;
+          // Prepare context for crisp rendering and get logical dimensions
+          const { width, height, dpr } = this.prepareCanvasContext(canvas, ctx);
           
           if (width === 0 || height === 0) return;
           
-          // Clear canvas
+          // Clear canvas (uses logical pixels because ctx is scaled)
           ctx.clearRect(0, 0, width, height);
           
           // Draw grid lines
