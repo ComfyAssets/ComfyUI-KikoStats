@@ -16,10 +16,9 @@ class ResourceMonitorNode(ComfyAssetsBaseNode):
     ComfyUI node for real-time resource monitoring
     
     Displays GPU utilization, VRAM usage, CPU usage, and RAM usage
-    with configurable update intervals and display modes.
+    with real-time updates at 1-second intervals.
     
     Inputs:
-        - update_interval (FLOAT): Monitoring refresh rate in seconds
         - display_mode (STRING): Output format ("text", "json", "both")
         - enable_gpu (BOOLEAN): Enable GPU monitoring
         - enable_system (BOOLEAN): Enable system monitoring
@@ -42,17 +41,6 @@ class ResourceMonitorNode(ComfyAssetsBaseNode):
         """
         return {
             "required": {
-                "update_interval": (
-                    "FLOAT",
-                    {
-                        "default": 1.0,
-                        "min": 0.1,
-                        "max": 60.0,
-                        "step": 0.1,
-                        "display": "slider",
-                        "tooltip": "How often to update monitoring data (seconds)"
-                    },
-                ),
                 "display_mode": (
                     ["text", "json", "both"],
                     {
@@ -85,7 +73,6 @@ class ResourceMonitorNode(ComfyAssetsBaseNode):
     
     def monitor_resources(
         self,
-        update_interval: float,
         display_mode: str,
         enable_gpu: bool = True,
         enable_system: bool = True,
@@ -94,7 +81,6 @@ class ResourceMonitorNode(ComfyAssetsBaseNode):
         Monitor system and GPU resources with real-time updates
         
         Args:
-            update_interval: Update frequency in seconds
             display_mode: Output format ("text", "json", "both")
             enable_gpu: Whether to monitor GPU resources
             enable_system: Whether to monitor system resources
@@ -108,7 +94,6 @@ class ResourceMonitorNode(ComfyAssetsBaseNode):
         try:
             # Validate inputs
             self.validate_inputs(
-                update_interval=update_interval,
                 display_mode=display_mode,
                 enable_gpu=enable_gpu,
                 enable_system=enable_system
@@ -216,7 +201,6 @@ class ResourceMonitorNode(ComfyAssetsBaseNode):
     
     def validate_inputs(
         self,
-        update_interval: float,
         display_mode: str,
         enable_gpu: bool,
         enable_system: bool,
@@ -225,7 +209,6 @@ class ResourceMonitorNode(ComfyAssetsBaseNode):
         Validate inputs specific to resource monitor
         
         Args:
-            update_interval: Update interval to validate
             display_mode: Display mode to validate
             enable_gpu: GPU monitoring flag
             enable_system: System monitoring flag
@@ -233,9 +216,6 @@ class ResourceMonitorNode(ComfyAssetsBaseNode):
         Raises:
             ValueError: If validation fails
         """
-        # Validate update interval
-        validate_update_interval(update_interval)
-        
         # Validate display mode
         valid_modes = ["text", "json", "both"]
         if display_mode not in valid_modes:
