@@ -353,9 +353,19 @@ app.registerExtension({
         // Set initial size
         this.size = [420, 700];
 
-        // Simple resize handler with constraints (Checkpoint Discovery Hub pattern)
+        // Simple resize handler with constraints and manual resize detection
         const MIN_W = 400, MIN_H = 600;
         this.onResize = function(size) {
+          // Detect if this is a manual resize by the user vs programmatic resize
+          if (!this.programmaticResize) {
+            // User manually resized the node - respect their choice
+            this.userHasManuallyResized = true;
+            
+            // Store the user's preferred size
+            this.userPreferredSize = [...size];
+          }
+          
+          // Apply minimum constraints
           if (size[0] < MIN_W) size[0] = MIN_W;
           if (size[1] < MIN_H) size[1] = MIN_H;
 
