@@ -1,7 +1,7 @@
 [project]
 name = "kikostats"
 description = "Real-time monitoring and statistics for ComfyUI"
-version = "0.1.2"
+version = "0.1.3"
 license = {file = "LICENSE"}
 dependencies = [
     "nvidia-ml-py>=12.535.161",
